@@ -17,8 +17,9 @@ Arch:
 sudo pacman -S xorg-server-devel libx11 libxcursor libxinerama libxrandr libxi libxxf86vm mingw-w64-gcc base-devel mesa libxinerama glfw-x11
 ```
 
-### Build for Windows
-
+Building:
 ```
-CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc GOOS=windows GOARCH=amd64 go build
+make - builds both windows and linux
+make linux
+make windows
 ```
