@@ -108,81 +108,233 @@ type MeshData struct {
 	ebo      uint32
 }
 
+type Scene struct {
+    meshes []MeshData
+    bounds Bounds
+}
+
+var scene Scene
+
 func init() {
 	runtime.LockOSThread()
 }
 
 func main() {
-	if err := glfw.Init(); err != nil {
-		log.Fatal(err)
-	}
-	defer glfw.Terminate()
+    if err := glfw.Init(); err != nil {
+        log.Fatal(err)
+    }
+    defer glfw.Terminate()
 
-	filename, err := selectOBJFile("")
-	if err != nil {
-		log.Fatal("Initial file selection failed:", err)
-	}
+    filenames, err := selectOBJFiles("")
+    if err != nil {
+        log.Fatal("Initial file selection failed:", err)
+    }
 
-	window, program := initializeWindow(filename)
-	defer window.Destroy()
+    window, program := initializeWindow(strings.Join(filenames, ", "))
+    defer window.Destroy()
 
-	meshData := loadAndSetupMesh(program, filename)
-	
-	for !window.ShouldClose() {
-		currentFrame := glfw.GetTime()
-		deltaTime = currentFrame - lastFrame
-		lastFrame = currentFrame
+    scene = loadAllMeshes(program, filenames)
+    
+    for !window.ShouldClose() {
+        currentFrame := glfw.GetTime()
+        deltaTime = currentFrame - lastFrame
+        lastFrame = currentFrame
 
-		processInput(window)
+        processInput(window)
 
-		// Check for file reload
-		if newFile, err := checkFileReload(window); err == nil && newFile != "" {
-			filename = newFile
-			window.SetTitle(fmt.Sprintf("NavMesh Viewer - %s", filename))
-			
-			// Clean up old mesh data
-			gl.DeleteVertexArrays(1, &meshData.vao)
-			gl.DeleteBuffers(1, &meshData.vbo)
-			gl.DeleteBuffers(1, &meshData.ebo)
-			
-			// Load new mesh
-			meshData = loadAndSetupMesh(program, filename)
-		}
+        // Check for file reload
+        if newFiles, err := checkFileReload(window); err == nil && len(newFiles) > 0 {
+            // Cleanup old scene
+            cleanupScene(&scene)
+            
+            // Load new scene
+            scene = loadAllMeshes(program, newFiles)
+            window.SetTitle(fmt.Sprintf("NavMesh Viewer - %s", strings.Join(newFiles, ", ")))
+        }
 
-		render(window, program, meshData)
+        renderScene(window, program, scene)
 
-		window.SwapBuffers()
-		glfw.PollEvents()
+        window.SwapBuffers()
+        glfw.PollEvents()
 
-		// Cap the frame rate at 60 FPS
-		time.Sleep(time.Second/60 - time.Duration(deltaTime)*time.Second)
-	}
+        time.Sleep(time.Second/60 - time.Duration(deltaTime)*time.Second)
+    }
 }
 
 func selectOBJFile(startDir string) (string, error) {
-	var opts []zenity.Option
-	opts = append(opts, zenity.Title("Select OBJ File"))
-	opts = append(opts, zenity.FileFilter{
-		Name:     "OBJ files",
-		Patterns: []string{"*.obj"},
-	})
-	
-	if startDir != "" {
-		// Add the file filter pattern to the directory path
-		opts = append(opts, zenity.Filename(filepath.Join(startDir, "*.obj")))
-	}
-	
-	filename, err := zenity.SelectFile(opts...)
-	if err != nil {
-		if err == zenity.ErrCanceled {
-			return "", fmt.Errorf("no file selected")
-		}
-		return "", err
-	}
-	
-	// Store the directory path
-	lastDirectory = filepath.Dir(filename)
-	return filename, nil
+    var opts []zenity.Option
+    opts = append(opts, zenity.Title("Select OBJ File"))
+    opts = append(opts, zenity.FileFilter{
+        Name:     "OBJ files",
+        Patterns: []string{"*.obj"},
+    })
+    
+    if startDir != "" {
+        opts = append(opts, zenity.Filename(filepath.Join(startDir, "*.obj")))
+    }
+    
+    filename, err := zenity.SelectFile(opts...)
+    if err != nil {
+        if err == zenity.ErrCanceled {
+            return "", fmt.Errorf("no file selected")
+        }
+        return "", err
+    }
+    
+    lastDirectory = filepath.Dir(filename)
+    return filename, nil
+}
+
+func selectOBJFiles(startDir string) ([]string, error) {
+    var opts []zenity.Option
+    opts = append(opts, zenity.Title("Select OBJ Files"))
+    opts = append(opts, zenity.FileFilter{
+        Name:     "OBJ files",
+        Patterns: []string{"*.obj"},
+    })
+    
+    if startDir != "" {
+        opts = append(opts, zenity.Filename(filepath.Join(startDir, "*.obj")))
+    }
+    
+    // Use SelectFileMultiple instead of SelectFile
+    filenames, err := zenity.SelectFileMultiple(opts...)
+    if err != nil {
+        if err == zenity.ErrCanceled {
+            return nil, fmt.Errorf("no files selected")
+        }
+        return nil, err
+    }
+    
+    if len(filenames) > 0 {
+        lastDirectory = filepath.Dir(filenames[0])
+    }
+    
+    return filenames, nil
+}
+
+func loadAllMeshes(program uint32, filenames []string) Scene {
+    var newScene Scene
+    newScene.meshes = make([]MeshData, 0, len(filenames))
+    
+    // Initialize bounds with first vertex of first mesh
+    firstMesh := loadSingleMesh(program, filenames[0])
+    newScene.bounds = firstMesh.bounds
+    newScene.meshes = append(newScene.meshes, firstMesh)
+    
+    // Load remaining meshes and update combined bounds
+    for i := 1; i < len(filenames); i++ {
+        mesh := loadSingleMesh(program, filenames[i])
+        newScene.meshes = append(newScene.meshes, mesh)
+        newScene.bounds = combineBounds(newScene.bounds, mesh.bounds)
+    }
+    
+    // Set camera to frame all meshes
+    initializeCamera(newScene.bounds)
+    return newScene
+}
+
+func loadSingleMesh(program uint32, filename string) MeshData {
+    vertices, indices := loadOBJFile(filename)
+    if len(vertices) == 0 || len(indices) == 0 {
+        log.Printf("Warning: No mesh data loaded from %s", filename)
+        return MeshData{}
+    }
+
+    bounds := calculateBounds(vertices)
+
+    var vao uint32
+    gl.GenVertexArrays(1, &vao)
+    gl.BindVertexArray(vao)
+
+    var vbo uint32
+    gl.GenBuffers(1, &vbo)
+    gl.BindBuffer(gl.ARRAY_BUFFER, vbo)
+    gl.BufferData(gl.ARRAY_BUFFER, len(vertices)*4, gl.Ptr(vertices), gl.STATIC_DRAW)
+
+    var ebo uint32
+    gl.GenBuffers(1, &ebo)
+    gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo)
+    gl.BufferData(gl.ELEMENT_ARRAY_BUFFER, len(indices)*4, gl.Ptr(indices), gl.STATIC_DRAW)
+
+    gl.EnableVertexAttribArray(0)
+    gl.VertexAttribPointer(0, 3, gl.FLOAT, false, 0, nil)
+
+    return MeshData{
+        vertices: vertices,
+        indices:  indices,
+        bounds:   bounds,
+        vao:      vao,
+        vbo:      vbo,
+        ebo:      ebo,
+    }
+}
+
+func combineBounds(a, b Bounds) Bounds {
+    return Bounds{
+        minX: float32(math.Min(float64(a.minX), float64(b.minX))),
+        minY: float32(math.Min(float64(a.minY), float64(b.minY))),
+        minZ: float32(math.Min(float64(a.minZ), float64(b.minZ))),
+        maxX: float32(math.Max(float64(a.maxX), float64(b.maxX))),
+        maxY: float32(math.Max(float64(a.maxY), float64(b.maxY))),
+        maxZ: float32(math.Max(float64(a.maxZ), float64(b.maxZ))),
+    }
+}
+
+func renderScene(window *glfw.Window, program uint32, scene Scene) {
+    gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+    gl.UseProgram(program)
+
+    // Calculate view and projection matrices based on combined bounds
+    sizeX := scene.bounds.maxX - scene.bounds.minX
+    sizeY := scene.bounds.maxY - scene.bounds.minY
+    sizeZ := scene.bounds.maxZ - scene.bounds.minZ
+    maxSize := float32(math.Max(float64(sizeX), math.Max(float64(sizeY), float64(sizeZ))))
+
+    projection := mgl32.Perspective(mgl32.DegToRad(45.0), float32(width)/float32(height), 0.1, maxSize*10)
+    view := mgl32.LookAtV(cameraPos, cameraPos.Add(cameraFront), cameraUp)
+    model := mgl32.Ident4()
+
+    projectionUniform := gl.GetUniformLocation(program, gl.Str("projection\x00"))
+    viewUniform := gl.GetUniformLocation(program, gl.Str("camera\x00"))
+    modelUniform := gl.GetUniformLocation(program, gl.Str("model\x00"))
+
+    gl.UniformMatrix4fv(projectionUniform, 1, false, &projection[0])
+    gl.UniformMatrix4fv(viewUniform, 1, false, &view[0])
+    gl.UniformMatrix4fv(modelUniform, 1, false, &model[0])
+
+    // Render each mesh
+    for _, mesh := range scene.meshes {
+        gl.BindVertexArray(mesh.vao)
+
+        // Draw solid mesh
+        gl.PolygonMode(gl.FRONT_AND_BACK, gl.FILL)
+        gl.Enable(gl.POLYGON_OFFSET_FILL)
+        gl.PolygonOffset(1.0, 1.0)
+        gl.Uniform1i(gl.GetUniformLocation(program, gl.Str("isWireframe\x00")), 0)
+        gl.DrawElements(gl.TRIANGLES, int32(len(mesh.indices)), gl.UNSIGNED_INT, nil)
+        gl.Disable(gl.POLYGON_OFFSET_FILL)
+
+        // Draw wireframe overlay
+        gl.PolygonMode(gl.FRONT_AND_BACK, gl.LINE)
+        gl.LineWidth(1.0)
+        gl.Uniform1i(gl.GetUniformLocation(program, gl.Str("isWireframe\x00")), 1)
+        gl.DrawElements(gl.TRIANGLES, int32(len(mesh.indices)), gl.UNSIGNED_INT, nil)
+    }
+
+    // Reset polygon mode
+    gl.PolygonMode(gl.FRONT_AND_BACK, gl.FILL)
+
+    window.SetTitle(fmt.Sprintf("NavMesh Viewer - Speed: %.1fx", speedMultipliers[currentSpeedIndex]))
+}
+
+func cleanupScene(scene *Scene) {
+    for i := range scene.meshes {
+        gl.DeleteVertexArrays(1, &scene.meshes[i].vao)
+        gl.DeleteBuffers(1, &scene.meshes[i].vbo)
+        gl.DeleteBuffers(1, &scene.meshes[i].ebo)
+    }
+    scene.meshes = nil
 }
 
 func initializeWindow(filename string) (*glfw.Window, uint32) {
@@ -332,11 +484,11 @@ func render(window *glfw.Window, program uint32, meshData MeshData) {
 	window.SetTitle(fmt.Sprintf("NavMesh Viewer - Speed: %.1fx", speedMultipliers[currentSpeedIndex]))
 }
 
-func checkFileReload(window *glfw.Window) (string, error) {
-	if window.GetKey(glfw.KeyF1) == glfw.Press {
-		return selectOBJFile(lastDirectory)
-	}
-	return "", nil
+func checkFileReload(window *glfw.Window) ([]string, error) {
+    if window.GetKey(glfw.KeyF1) == glfw.Press {
+        return selectOBJFiles(lastDirectory)
+    }
+    return nil, nil
 }
 
 func processInput(window *glfw.Window) {
