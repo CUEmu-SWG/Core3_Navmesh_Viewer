@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -40,6 +41,9 @@ var (
 	speedMultipliers  = []float64{1, 5, 10, 20, 40}
 	currentSpeedIndex = 0
 	lastShiftState    = glfw.Release
+	
+	// Directory tracking
+	lastDirectory string
 )
 
 const (
@@ -90,13 +94,22 @@ const (
     ` + "\x00"
 )
 
-func init() {
-	runtime.LockOSThread()
-}
-
 type Bounds struct {
 	minX, minY, minZ float32
 	maxX, maxY, maxZ float32
+}
+
+type MeshData struct {
+	vertices []float32
+	indices  []uint32
+	bounds   Bounds
+	vao      uint32
+	vbo      uint32
+	ebo      uint32
+}
+
+func init() {
+	runtime.LockOSThread()
 }
 
 func main() {
@@ -105,20 +118,74 @@ func main() {
 	}
 	defer glfw.Terminate()
 
-	filename, err := zenity.SelectFile(
-		zenity.Title("Select OBJ File"),
-		zenity.FileFilter{
-			Name:     "OBJ files",
-			Patterns: []string{"*.obj"},
-		},
-	)
+	filename, err := selectOBJFile("")
 	if err != nil {
-		if err == zenity.ErrCanceled {
-			log.Fatal("No file selected")
-		}
-		log.Fatal("Error selecting file:", err)
+		log.Fatal("Initial file selection failed:", err)
 	}
 
+	window, program := initializeWindow(filename)
+	defer window.Destroy()
+
+	meshData := loadAndSetupMesh(program, filename)
+	
+	for !window.ShouldClose() {
+		currentFrame := glfw.GetTime()
+		deltaTime = currentFrame - lastFrame
+		lastFrame = currentFrame
+
+		processInput(window)
+
+		// Check for file reload
+		if newFile, err := checkFileReload(window); err == nil && newFile != "" {
+			filename = newFile
+			window.SetTitle(fmt.Sprintf("NavMesh Viewer - %s", filename))
+			
+			// Clean up old mesh data
+			gl.DeleteVertexArrays(1, &meshData.vao)
+			gl.DeleteBuffers(1, &meshData.vbo)
+			gl.DeleteBuffers(1, &meshData.ebo)
+			
+			// Load new mesh
+			meshData = loadAndSetupMesh(program, filename)
+		}
+
+		render(window, program, meshData)
+
+		window.SwapBuffers()
+		glfw.PollEvents()
+
+		// Cap the frame rate at 60 FPS
+		time.Sleep(time.Second/60 - time.Duration(deltaTime)*time.Second)
+	}
+}
+
+func selectOBJFile(startDir string) (string, error) {
+	var opts []zenity.Option
+	opts = append(opts, zenity.Title("Select OBJ File"))
+	opts = append(opts, zenity.FileFilter{
+		Name:     "OBJ files",
+		Patterns: []string{"*.obj"},
+	})
+	
+	if startDir != "" {
+		// Add the file filter pattern to the directory path
+		opts = append(opts, zenity.Filename(filepath.Join(startDir, "*.obj")))
+	}
+	
+	filename, err := zenity.SelectFile(opts...)
+	if err != nil {
+		if err == zenity.ErrCanceled {
+			return "", fmt.Errorf("no file selected")
+		}
+		return "", err
+	}
+	
+	// Store the directory path
+	lastDirectory = filepath.Dir(filename)
+	return filename, nil
+}
+
+func initializeWindow(filename string) (*glfw.Window, uint32) {
 	glfw.WindowHint(glfw.ContextVersionMajor, 4)
 	glfw.WindowHint(glfw.ContextVersionMinor, 1)
 	glfw.WindowHint(glfw.OpenGLProfile, glfw.OpenGLCoreProfile)
@@ -140,31 +207,57 @@ func main() {
 		log.Fatal(err)
 	}
 
+	program := initializeShaders()
+	
+	gl.Enable(gl.DEPTH_TEST)
+	gl.Enable(gl.CULL_FACE)
+	gl.Enable(gl.MULTISAMPLE)
+	gl.ClearColor(0.2, 0.2, 0.2, 1.0)
+
+	return window, program
+}
+
+func initializeCamera(bounds Bounds) {
+	// Calculate mesh center
+	centerX := (bounds.minX + bounds.maxX) / 2
+	centerY := (bounds.minY + bounds.maxY) / 2
+	centerZ := (bounds.minZ + bounds.maxZ) / 2
+	
+	// Calculate mesh size
+	sizeX := bounds.maxX - bounds.minX
+	sizeY := bounds.maxY - bounds.minY
+	sizeZ := bounds.maxZ - bounds.minZ
+	maxSize := float32(math.Max(float64(sizeX), math.Max(float64(sizeY), float64(sizeZ))))
+	
+	// Position camera at a reasonable viewing distance
+	viewDistance := maxSize * 0.8
+	cameraPos = mgl32.Vec3{
+		centerX,
+		centerY + maxSize * 0.3,
+		centerZ + viewDistance,
+	}
+	
+	// Reset camera orientation
+	yaw = -90.0
+	pitch = -20.0
+	
+	// Update camera front vector
+	direction := mgl32.Vec3{
+		float32(math.Cos(float64(mgl32.DegToRad(float32(yaw)))) * math.Cos(float64(mgl32.DegToRad(float32(pitch))))),
+		float32(math.Sin(float64(mgl32.DegToRad(float32(pitch))))),
+		float32(math.Sin(float64(mgl32.DegToRad(float32(yaw)))) * math.Cos(float64(mgl32.DegToRad(float32(pitch))))),
+	}
+	cameraFront = direction.Normalize()
+}
+
+func loadAndSetupMesh(program uint32, filename string) MeshData {
 	vertices, indices := loadOBJFile(filename)
 	if len(vertices) == 0 || len(indices) == 0 {
 		log.Fatal("No mesh data loaded")
 	}
 
 	bounds := calculateBounds(vertices)
-
-	centerX := (bounds.minX + bounds.maxX) / 2
-	centerY := (bounds.minY + bounds.maxY) / 2
-	centerZ := (bounds.minZ + bounds.maxZ) / 2
-
-	sizeX := bounds.maxX - bounds.minX
-	sizeY := bounds.maxY - bounds.minY
-	sizeZ := bounds.maxZ - bounds.minZ
-	maxSize := float32(math.Max(float64(sizeX), math.Max(float64(sizeY), float64(sizeZ))))
-
-	cameraPos = mgl32.Vec3{centerX, centerY + maxSize*0.5, centerZ + maxSize*1.5}
-
-	program := gl.CreateProgram()
-	vertexShader := compileShader(vertexShaderSource, gl.VERTEX_SHADER)
-	fragmentShader := compileShader(fragmentShaderSource, gl.FRAGMENT_SHADER)
-
-	gl.AttachShader(program, vertexShader)
-	gl.AttachShader(program, fragmentShader)
-	gl.LinkProgram(program)
+	initializeCamera(bounds)
 
 	var vao uint32
 	gl.GenVertexArrays(1, &vao)
@@ -183,60 +276,67 @@ func main() {
 	gl.EnableVertexAttribArray(0)
 	gl.VertexAttribPointer(0, 3, gl.FLOAT, false, 0, nil)
 
+	return MeshData{
+		vertices: vertices,
+		indices:  indices,
+		bounds:   bounds,
+		vao:      vao,
+		vbo:      vbo,
+		ebo:      ebo,
+	}
+}
+
+func render(window *glfw.Window, program uint32, meshData MeshData) {
+	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+	gl.UseProgram(program)
+
+	maxSize := float32(math.Max(
+		float64(meshData.bounds.maxX-meshData.bounds.minX),
+		math.Max(
+			float64(meshData.bounds.maxY-meshData.bounds.minY),
+			float64(meshData.bounds.maxZ-meshData.bounds.minZ),
+		),
+	))
+
+	projection := mgl32.Perspective(mgl32.DegToRad(45.0), float32(width)/float32(height), 0.1, maxSize*10)
+	view := mgl32.LookAtV(cameraPos, cameraPos.Add(cameraFront), cameraUp)
+	model := mgl32.Ident4()
+
 	projectionUniform := gl.GetUniformLocation(program, gl.Str("projection\x00"))
 	viewUniform := gl.GetUniformLocation(program, gl.Str("camera\x00"))
 	modelUniform := gl.GetUniformLocation(program, gl.Str("model\x00"))
 
-	gl.Enable(gl.DEPTH_TEST)
-	gl.Enable(gl.CULL_FACE)
-	gl.Enable(gl.MULTISAMPLE)
-	gl.ClearColor(0.2, 0.2, 0.2, 1.0)
+	gl.UniformMatrix4fv(projectionUniform, 1, false, &projection[0])
+	gl.UniformMatrix4fv(viewUniform, 1, false, &view[0])
+	gl.UniformMatrix4fv(modelUniform, 1, false, &model[0])
 
-	lastFrame = glfw.GetTime()
+	gl.BindVertexArray(meshData.vao)
 
-	for !window.ShouldClose() {
-		currentFrame := glfw.GetTime()
-		deltaTime = currentFrame - lastFrame
-		lastFrame = currentFrame
+	// Draw solid mesh
+	gl.PolygonMode(gl.FRONT_AND_BACK, gl.FILL)
+	gl.Enable(gl.POLYGON_OFFSET_FILL)
+	gl.PolygonOffset(1.0, 1.0)
+	gl.Uniform1i(gl.GetUniformLocation(program, gl.Str("isWireframe\x00")), 0)
+	gl.DrawElements(gl.TRIANGLES, int32(len(meshData.indices)), gl.UNSIGNED_INT, nil)
+	gl.Disable(gl.POLYGON_OFFSET_FILL)
 
-		processInput(window)
+	// Draw wireframe overlay
+	gl.PolygonMode(gl.FRONT_AND_BACK, gl.LINE)
+	gl.LineWidth(1.0)
+	gl.Uniform1i(gl.GetUniformLocation(program, gl.Str("isWireframe\x00")), 1)
+	gl.DrawElements(gl.TRIANGLES, int32(len(meshData.indices)), gl.UNSIGNED_INT, nil)
 
-		gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
-		gl.UseProgram(program)
+	// Reset polygon mode
+	gl.PolygonMode(gl.FRONT_AND_BACK, gl.FILL)
 
-		projection := mgl32.Perspective(mgl32.DegToRad(45.0), float32(width)/float32(height), 0.1, maxSize*10)
-		view := mgl32.LookAtV(cameraPos, cameraPos.Add(cameraFront), cameraUp)
-		model := mgl32.Ident4()
+	window.SetTitle(fmt.Sprintf("NavMesh Viewer - Speed: %.1fx", speedMultipliers[currentSpeedIndex]))
+}
 
-		gl.UniformMatrix4fv(projectionUniform, 1, false, &projection[0])
-		gl.UniformMatrix4fv(viewUniform, 1, false, &view[0])
-		gl.UniformMatrix4fv(modelUniform, 1, false, &model[0])
-
-		// Draw solid mesh
-		gl.PolygonMode(gl.FRONT_AND_BACK, gl.FILL)
-		gl.Enable(gl.POLYGON_OFFSET_FILL)
-		gl.PolygonOffset(1.0, 1.0)
-		gl.Uniform1i(gl.GetUniformLocation(program, gl.Str("isWireframe\x00")), 0)
-		gl.DrawElements(gl.TRIANGLES, int32(len(indices)), gl.UNSIGNED_INT, nil)
-		gl.Disable(gl.POLYGON_OFFSET_FILL)
-
-		// Draw wireframe overlay
-		gl.PolygonMode(gl.FRONT_AND_BACK, gl.LINE)
-		gl.LineWidth(1.0)
-		gl.Uniform1i(gl.GetUniformLocation(program, gl.Str("isWireframe\x00")), 1)
-		gl.DrawElements(gl.TRIANGLES, int32(len(indices)), gl.UNSIGNED_INT, nil)
-
-		// Reset polygon mode
-		gl.PolygonMode(gl.FRONT_AND_BACK, gl.FILL)
-
-		window.SetTitle(fmt.Sprintf("NavMesh Viewer - Speed: %.1fx", speedMultipliers[currentSpeedIndex]))
-
-		window.SwapBuffers()
-		glfw.PollEvents()
-
-		// Cap the frame rate at 60 FPS
-		time.Sleep(time.Second/60 - time.Duration(deltaTime)*time.Second)
+func checkFileReload(window *glfw.Window) (string, error) {
+	if window.GetKey(glfw.KeyF1) == glfw.Press {
+		return selectOBJFile(lastDirectory)
 	}
+	return "", nil
 }
 
 func processInput(window *glfw.Window) {
@@ -379,6 +479,32 @@ func loadOBJFile(filename string) ([]float32, []uint32) {
 
 	log.Printf("Loaded %d vertices and %d indices", len(vertices)/3, len(indices))
 	return vertices, indices
+}
+
+func initializeShaders() uint32 {
+	program := gl.CreateProgram()
+	
+	vertexShader := compileShader(vertexShaderSource, gl.VERTEX_SHADER)
+	fragmentShader := compileShader(fragmentShaderSource, gl.FRAGMENT_SHADER)
+
+	gl.AttachShader(program, vertexShader)
+	gl.AttachShader(program, fragmentShader)
+	gl.LinkProgram(program)
+
+	var status int32
+	gl.GetProgramiv(program, gl.LINK_STATUS, &status)
+	if status == gl.FALSE {
+		var logLength int32
+		gl.GetProgramiv(program, gl.INFO_LOG_LENGTH, &logLength)
+		log := strings.Repeat("\x00", int(logLength+1))
+		gl.GetProgramInfoLog(program, logLength, nil, gl.Str(log))
+		panic(fmt.Errorf("failed to link program: %v", log))
+	}
+
+	gl.DeleteShader(vertexShader)
+	gl.DeleteShader(fragmentShader)
+
+	return program
 }
 
 func compileShader(source string, shaderType uint32) uint32 {
